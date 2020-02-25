@@ -12,13 +12,16 @@ from torch import nn, optim
 from torch.nn import functional as F
 from torchvision import datasets, transforms
 from torchvision.utils import save_image
-
+from torch.utils.tensorboard import SummaryWriter
+import time
+from time import localtime
+import os
 parser = argparse.ArgumentParser(description='VAE MNIST Example')
 parser.add_argument('--batch-size', type=int, default=100, metavar='N',
                     help='input batch size for training (default: 100)')
 parser.add_argument('--epochs', type=int, default=10, metavar='N',
                     help='number of epochs to train (default: 10)')
-parser.add_argument('--temp', type=float, default=1.0, metavar='S',
+parser.add_argument('--temp', type=float, default=0.66, metavar='S',
                     help='tau(temperature) (default: 1.0)')
 parser.add_argument('--no-cuda', action='store_true', default=False,
                     help='enables CUDA training')
@@ -28,10 +31,12 @@ parser.add_argument('--log-interval', type=int, default=10, metavar='N',
                     help='how many batches to wait before logging training status')
 parser.add_argument('--hard', action='store_true', default=False,
                     help='hard Gumbel softmax')
-
+parser.add_argument('--lr', type=float, default=1e-3,
+                    help='learning rate')
+parser.add_argument('--gpu', type=str, default="1")
 args = parser.parse_args()
 args.cuda = not args.no_cuda and torch.cuda.is_available()
-
+os.environ["CUDA_VISIBLE_DEVICES"] = args.gpu
 torch.manual_seed(args.seed)
 if args.cuda:
     torch.cuda.manual_seed(args.seed)
@@ -46,19 +51,21 @@ test_loader = torch.utils.data.DataLoader(
     batch_size=args.batch_size, shuffle=True, **kwargs)
 
 
-def sample_gumbel(shape, eps=1e-20):
-    U = torch.rand(shape)
-    if args.cuda:
-        U = U.cuda()
-    return -torch.log(-torch.log(U + eps) + eps)
+def gumbel_softmax_sample(logits, temperature, eps=1e-20):
+    U = torch.rand(logits.size()).type_as(logits) + eps
+    g = torch.log(U) - torch.log(1 - U)
+    y = logits + g
+    # return F.softmax(y / temperature, dim=-1)
+    return F.sigmoid(y / temperature)
 
 
-def gumbel_softmax_sample(logits, temperature):
-    y = logits + sample_gumbel(logits.size())
-    return F.softmax(y / temperature, dim=-1)
+def gumbel_softmax_sample_test(logits, temperature, eps=1e-20):
 
+    y = logits
+    # return F.softmax(y / temperature, dim=-1)
+    return F.sigmoid(y / temperature)
 
-def gumbel_softmax(logits, temperature, hard=False):
+def gumbel_softmax(logits, temperature, hard=True,train=False):
     """
     ST-gumple-softmax
     input: [*, n_class]
@@ -69,11 +76,12 @@ def gumbel_softmax(logits, temperature, hard=False):
     if not hard:
         return y.view(-1, latent_dim * categorical_dim)
 
-    shape = y.size()
-    _, ind = y.max(dim=-1)
-    y_hard = torch.zeros_like(y).view(-1, shape[-1])
-    y_hard.scatter_(1, ind.view(-1, 1), 1)
-    y_hard = y_hard.view(*shape)
+    # shape = y.size()
+    # ind = (y >= 0.5).view(-1,shape[-1])
+    y_hard = torch.zeros_like(y)
+    # y_hard.scatter_(1, ind.view(-1, 1), 1)
+    y_hard[y >= 0.5] = 1
+    # y_hard = y_hard.view(*shape)
     # Set gradients w.r.t. y_hard gradients w.r.t. y
     y_hard = (y_hard - y).detach() + y
     return y_hard.view(-1, latent_dim * categorical_dim)
@@ -97,7 +105,7 @@ class VAE_gumbel(nn.Module):
     def encode(self, x):
         h1 = self.relu(self.fc1(x))
         h2 = self.relu(self.fc2(h1))
-        return self.relu(self.fc3(h2))
+        return self.fc3(h2)
 
     def decode(self, z):
         h4 = self.relu(self.fc4(z))
@@ -108,11 +116,12 @@ class VAE_gumbel(nn.Module):
         q = self.encode(x.view(-1, 784))
         q_y = q.view(q.size(0), latent_dim, categorical_dim)
         z = gumbel_softmax(q_y, temp, hard)
-        return self.decode(z), F.softmax(q_y, dim=-1).reshape(*q.size())
+        return self.decode(z), F.sigmoid(q_y).reshape(*q.size())
 
-
-latent_dim = 30
-categorical_dim = 10  # one-of-K vector
+current_time = time.strftime('%M_%S', localtime())
+writer = SummaryWriter(log_dir='runs/vae' + current_time , flush_secs=30)
+latent_dim = 10
+categorical_dim = 5  # one-of-K vector
 
 temp_min = 0.5
 ANNEAL_RATE = 0.00003
@@ -120,16 +129,17 @@ ANNEAL_RATE = 0.00003
 model = VAE_gumbel(args.temp)
 if args.cuda:
     model.cuda()
-optimizer = optim.Adam(model.parameters(), lr=1e-3)
+optimizer = optim.Adam(model.parameters(), lr=args.lr)
 
 
 # Reconstruction + KL divergence losses summed over all elements and batch
 def loss_function(recon_x, x, qy):
     BCE = F.binary_cross_entropy(recon_x, x.view(-1, 784), size_average=False) / x.shape[0]
 
-    log_ratio = torch.log(qy * categorical_dim + 1e-20)
-    KLD = torch.sum(qy * log_ratio, dim=-1).mean()
-
+    # log_ratio = torch.log(qy * categorical_dim + 1e-20)
+    # KLD = torch.sum(qy * log_ratio, dim=-1).mean()
+    qy2 = 1 - qy
+    KLD = (qy*torch.log(qy*2 + 1e-20) + qy2*torch.log(qy2*2 + 1e-20)).mean()
     return BCE + KLD
 
 
@@ -146,15 +156,15 @@ def train(epoch):
         loss.backward()
         train_loss += loss.item() * len(data)
         optimizer.step()
-        if batch_idx % 100 == 1:
-            temp = np.maximum(temp * np.exp(-ANNEAL_RATE * batch_idx), temp_min)
+        # if batch_idx % 100 == 1:
+        #     temp = np.maximum(temp * np.exp(-ANNEAL_RATE * batch_idx), temp_min)
 
         if batch_idx % args.log_interval == 0:
             print('Train Epoch: {} [{}/{} ({:.0f}%)]\tLoss: {:.6f}'.format(
                 epoch, batch_idx * len(data), len(train_loader.dataset),
                        100. * batch_idx / len(train_loader),
-                       loss.item()))
-
+                loss.item()))
+    writer.add_scalar('vaeLoss/train', train_loss / len(train_loader.dataset), epoch)
     print('====> Epoch: {} Average loss: {:.4f}'.format(
         epoch, train_loss / len(train_loader.dataset)))
 
@@ -168,8 +178,8 @@ def test(epoch):
             data = data.cuda()
         recon_batch, qy = model(data, temp, args.hard)
         test_loss += loss_function(recon_batch, data, qy).item() * len(data)
-        if i % 100 == 1:
-            temp = np.maximum(temp * np.exp(-ANNEAL_RATE * i), temp_min)
+        # if i % 100 == 1:
+        #     temp = np.maximum(temp * np.exp(-ANNEAL_RATE * i), temp_min)
         if i == 0:
             n = min(data.size(0), 8)
             comparison = torch.cat([data[:n],
@@ -178,6 +188,7 @@ def test(epoch):
                        'data/reconstruction_' + str(epoch) + '.png', nrow=n)
 
     test_loss /= len(test_loader.dataset)
+    writer.add_scalar('vaeLoss/test', test_loss, epoch)
     print('====> Test set loss: {:.4f}'.format(test_loss))
 
 
@@ -186,15 +197,14 @@ def run():
         train(epoch)
         test(epoch)
 
-        M = 64 * latent_dim
-        np_y = np.zeros((M, categorical_dim), dtype=np.float32)
-        np_y[range(M), np.random.choice(categorical_dim, M)] = 1
-        np_y = np.reshape(np_y, [M // latent_dim, latent_dim, categorical_dim])
-        sample = torch.from_numpy(np_y).view(M // latent_dim, latent_dim * categorical_dim)
+        M = 64 * latent_dim*categorical_dim
+        np_y = np.random.choice(2, M).astype(np.float32)
+        np_y = np.reshape(np_y, [-1, latent_dim, categorical_dim])
+        sample = torch.from_numpy(np_y).view(-1, latent_dim * categorical_dim)
         if args.cuda:
             sample = sample.cuda()
         sample = model.decode(sample).cpu()
-        save_image(sample.data.view(M // latent_dim, 1, 28, 28),
+        save_image(sample.data.view(-1, 1, 28, 28),
                    'data/sample_' + str(epoch) + '.png')
 
 
